@@ -10,7 +10,26 @@ import ocrmypdf
 import pikepdf
 from tqdm import tqdm
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+class _TqdmLoggingHandler(logging.StreamHandler):
+    """Перенаправляет log-сообщения через tqdm.write, чтобы не ломать прогресс-бары."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            tqdm.write(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+for _h in _root.handlers[:]:
+    _root.removeHandler(_h)
+_tqdm_handler = _TqdmLoggingHandler()
+_tqdm_handler.setFormatter(
+    logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+)
+_root.addHandler(_tqdm_handler)
 logger = logging.getLogger(__name__)
 
 
@@ -25,6 +44,55 @@ def get_optimal_jobs() -> int:
     cpu_count = os.cpu_count() or 1
     max_jobs = max(1, int(cpu_count * 0.75))
     return max_jobs
+
+
+def _restore_original_images(source_pdf: Path, ocr_pdf: Path, output_pdf: Path) -> None:
+    """
+    Заменяет изображения в OCR-версии на оригиналы из source_pdf.
+
+    Используется при oversample > 0: ocrmypdf рендерит страницы на высоком DPI для Tesseract
+    и встраивает апсемплированные картинки в PDF. Эта функция берёт текстовые слои из
+    ocr_pdf, но картинки подменяет оригинальными из source_pdf.
+
+    Это работает корректно, потому что текстовый слой хранится в координатах PDF (pt),
+    а не в пикселях — позиции слов не зависят от разрешения встроенного изображения.
+
+    Args:
+        source_pdf: PDF с оригинальными (нетронутыми) изображениями
+        ocr_pdf: PDF с текстовым слоем после ocrmypdf (может содержать апсемплированные картинки)
+        output_pdf: Путь для сохранения результата
+    """
+    src = pikepdf.open(source_pdf)
+    ocr = pikepdf.open(ocr_pdf)
+    replaced = 0
+
+    for src_page, ocr_page in zip(src.pages, ocr.pages):
+        src_res = src_page.get("/Resources") or pikepdf.Dictionary()
+        src_xobj = src_res.get("/XObject") or {}
+        ocr_res = ocr_page.get("/Resources") or pikepdf.Dictionary()
+        ocr_xobj = ocr_res.get("/XObject") or {}
+
+        # Собираем оригинальные Image XObjects из source по имени
+        src_images = {
+            k: v for k, v in src_xobj.items() if v.get("/Subtype") == "/Image"
+        }
+        if not src_images:
+            continue
+
+        for key in list(ocr_xobj.keys()):
+            obj = ocr_xobj[key]
+            if obj.get("/Subtype") != "/Image":
+                continue
+            # Берём оригинал с тем же именем, иначе — первый доступный
+            src_img = src_images.get(key) or next(iter(src_images.values()))
+            ocr_xobj[key] = ocr.copy_foreign(src_img)
+            replaced += 1
+
+    ocr.save(output_pdf)
+    src.close()
+    ocr.close()
+    if replaced > 0:
+        logger.info(f"  Восстановлены оригинальные картинки на {replaced} страницах")
 
 
 def _fix_mediabox(input_pdf: Path, fixed_pdf: Path) -> None:
@@ -72,6 +140,7 @@ def process_pdf_with_ocr(
     pages: str | None = None,
     clean: bool = True,
     oversample: int = 600,
+    deskew: bool = False,
 ) -> bool:
     """
     Добавляет текстовый слой к PDF-документу с помощью ocrmypdf.
@@ -91,7 +160,14 @@ def process_pdf_with_ocr(
         dpi: DPI для рендеринга страниц (по умолчанию 300)
         pages: Диапазон страниц для обработки (например "5-7"), None — все страницы
         clean: Удаление шума через unpaper перед OCR (не затрагивает финальное изображение)
-        oversample: Повышение разрешения до указанного DPI перед OCR (0 — без повышения)
+        oversample: Повышение разрешения до указанного DPI перед OCR (0 — отключено).
+                ВНИМАНИЕ: если значение > DPI исходника, ocrmypdf растеризует страницу
+                заново и встраивает апсемплированную картинку в выходной PDF.
+                Для сканов с оригинальным DPI=300 следует оставлять 0.
+        deskew: Исправление наклона листа через unpaper перед OCR.
+                ВНИМАНИЕ: в отличие от --clean, deskew ИЗМЕНЯЕТ финальное изображение
+                (физически поворачивает и перекодирует JPEG). Если важно сохранить
+                оригинальную картинку — держите False.
 
     Returns:
         True если обработка успешна, False иначе
@@ -119,8 +195,10 @@ def process_pdf_with_ocr(
             # --skip-text — пропускать страницы, где уже есть текст
             # --optimize 0 — без дополнительной оптимизации (сохраняем оригинал)
             # --clean — удаление шума через unpaper (только для OCR, не для финала)
+            # --deskew — исправление наклона через unpaper (МЕНЯЕТ финальную картинку)
             # --oversample — повышение разрешения для лучшего распознавания
             # --rotate-pages — автоопределение ориентации (для повёрнутых на 90° таблиц)
+            # progress_bar — постраничный прогресс внутри каждого PDF
             kwargs: dict = dict(
                 language=lang_list,
                 jobs=jobs,
@@ -128,14 +206,23 @@ def process_pdf_with_ocr(
                 skip_text=True,
                 optimize=0,
                 clean=clean,
+                deskew=deskew,
                 oversample=oversample,
                 rotate_pages=True,
+                progress_bar=True,
             )
 
             if pages is not None:
                 kwargs["pages"] = pages
 
-            ocrmypdf.ocr(fixed_path, output_pdf, **kwargs)
+            if oversample > 0:
+                # OCR выполняется на апсемплированной картинке (лучше распознавание),
+                # но в финальный PDF встраиваются оригинальные изображения из fixed_path.
+                ocr_hires = Path(tmpdir) / "ocr_hires.pdf"
+                ocrmypdf.ocr(fixed_path, ocr_hires, **kwargs)
+                _restore_original_images(fixed_path, ocr_hires, output_pdf)
+            else:
+                ocrmypdf.ocr(fixed_path, output_pdf, **kwargs)
 
         logger.info(f"✓ Успешно обработан {input_pdf.name}")
         return True
@@ -179,6 +266,7 @@ def process_directory(
     language: str = "rus",
     skip_existing: bool = False,
     jobs: int | None = None,
+    deskew: bool = False,
 ) -> tuple[int, int]:
     """
     Рекурсивно обрабатывает все PDF-файлы в директории и поддиректориях.
@@ -192,6 +280,7 @@ def process_directory(
         language: Язык распознавания
         skip_existing: Пропускать уже обработанные файлы
         jobs: Количество параллельных задач
+        deskew: Исправление наклона листа перед OCR (МЕНЯЕТ финальное изображение)
 
     Returns:
         Кортеж (успешно обработано, всего файлов)
@@ -226,7 +315,9 @@ def process_directory(
         # Создаём промежуточные подпапки, если нужно
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
-        if process_pdf_with_ocr(pdf_file, output_file, language, skip_existing, jobs):
+        if process_pdf_with_ocr(
+            pdf_file, output_file, language, skip_existing, jobs, deskew=deskew
+        ):
             success_count += 1
 
         # Обновляем описание прогресс-бара с текущим счётчиком
@@ -284,7 +375,9 @@ def test_on_sample_pages():
         text = verify_ocr_text(test_output, page_idx)
         preview = text[:300].strip()
         has_cyrillic = any("\u0400" <= ch <= "\u04ff" for ch in text)
-        logger.info(f"--- Страница {page_idx + 1} (кириллица: {'✓' if has_cyrillic else '✗'}) ---")
+        logger.info(
+            f"--- Страница {page_idx + 1} (кириллица: {'✓' if has_cyrillic else '✗'}) ---"
+        )
         logger.info(f"{preview}")
 
     # Удаляем тестовый файл
@@ -308,6 +401,7 @@ def main():
         output_dir=output_dir,
         language="rus",
         skip_existing=True,
+        deskew=False,
     )
 
     logger.info(f"\n{'=' * 50}")
