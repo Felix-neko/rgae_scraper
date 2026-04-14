@@ -1,0 +1,10 @@
+[project]
+name = "rgae-scraper"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "ocrmypdf>=16.0.0",  # Добавление текстового слоя к PDF через Tesseract OCR
+    "tqdm>=4.66.0",      # Прогресс-бар для обработки файлов
+    "pymupdf>=1.24.0",   # Извлечение текста из PDF для верификации
+]

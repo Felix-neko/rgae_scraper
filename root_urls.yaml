@@ -1,0 +1,12 @@
+root_fund_urls:
+# 1952
+- http://opisi.rgae.ru/scripts/uis/rgae_any.php?base=mysql:rgae&list=7108&idObj=6278&sort=litnum&id1=239411&id2=239435&currentpage=3&opismode=delas
+# 1964-1976
+- http://opisi.rgae.ru/scripts/uis/rgae_any.php?base=mysql:rgae&list=6925&idObj=7891&sort=litnum&id1=249872&id2=249896&currentpage=12&opismode=delas
+#
+- http://opisi.rgae.ru/scripts/uis/rgae_any.php?base=mysql:rgae&list=7126&idObj=8988&sort=litnum&id1=257298&id2=257322&currentpage=7&opismode=delas
+
+db:
+  temp.sqlite
+
+out_folder: ./out
