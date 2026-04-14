@@ -70,6 +70,8 @@ def process_pdf_with_ocr(
     jobs: int | None = None,
     dpi: int = 300,
     pages: str | None = None,
+    clean: bool = True,
+    oversample: int = 600,
 ) -> bool:
     """
     Добавляет текстовый слой к PDF-документу с помощью ocrmypdf.
@@ -88,6 +90,8 @@ def process_pdf_with_ocr(
         jobs: Количество параллельных задач для Tesseract
         dpi: DPI для рендеринга страниц (по умолчанию 300)
         pages: Диапазон страниц для обработки (например "5-7"), None — все страницы
+        clean: Удаление шума через unpaper перед OCR (не затрагивает финальное изображение)
+        oversample: Повышение разрешения до указанного DPI перед OCR (0 — без повышения)
 
     Returns:
         True если обработка успешна, False иначе
@@ -114,12 +118,18 @@ def process_pdf_with_ocr(
             # --output-type pdf — без принудительной конвертации в PDF/A (минимальные изменения)
             # --skip-text — пропускать страницы, где уже есть текст
             # --optimize 0 — без дополнительной оптимизации (сохраняем оригинал)
+            # --clean — удаление шума через unpaper (только для OCR, не для финала)
+            # --oversample — повышение разрешения для лучшего распознавания
+            # --rotate-pages — автоопределение ориентации (для повёрнутых на 90° таблиц)
             kwargs: dict = dict(
                 language=lang_list,
                 jobs=jobs,
                 output_type="pdf",
                 skip_text=True,
                 optimize=0,
+                clean=clean,
+                oversample=oversample,
+                rotate_pages=True,
             )
 
             if pages is not None:
@@ -286,8 +296,9 @@ def main():
     """Основная функция для запуска обработки."""
     # Определяем пути относительно текущего файла
     script_dir = Path(__file__).parent
-    input_dir = script_dir / "ocr_src"
-    output_dir = script_dir / "ocr_dest"
+    # input_dir = script_dir / "ocr_src"
+    input_dir = Path("/mnt/dump3/DOWN/Плановое хозяйство (1931-1989)")
+    output_dir = Path("/mnt/dump3/DOWN/Плановое хозяйство (1931-1989) [распознанное]")
 
     logger.info(f"Исходная директория: {input_dir}")
     logger.info(f"Целевая директория: {output_dir}")
