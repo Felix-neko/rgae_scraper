@@ -11,6 +11,9 @@ import pikepdf
 from tqdm import tqdm
 
 
+SPREAD_ASPECT_THRESHOLD: float = 288.0 / 250.0  # ≈ 1.152: разворот vs обычная страница
+
+
 class _TqdmLoggingHandler(logging.StreamHandler):
     """Перенаправляет log-сообщения через tqdm.write, чтобы не ломать прогресс-бары."""
 
@@ -26,9 +29,7 @@ _root.setLevel(logging.INFO)
 for _h in _root.handlers[:]:
     _root.removeHandler(_h)
 _tqdm_handler = _TqdmLoggingHandler()
-_tqdm_handler.setFormatter(
-    logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-)
+_tqdm_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 _root.addHandler(_tqdm_handler)
 logger = logging.getLogger(__name__)
 
@@ -67,15 +68,22 @@ def _restore_original_images(source_pdf: Path, ocr_pdf: Path, output_pdf: Path) 
     replaced = 0
 
     for src_page, ocr_page in zip(src.pages, ocr.pages):
+        # Восстанавливаем MediaBox и CropBox из source_pdf
+        src_mediabox = src_page.get("/MediaBox")
+        src_cropbox = src_page.get("/CropBox")
+        if src_mediabox is not None:
+            ocr_page["/MediaBox"] = pikepdf.Array([float(x) for x in src_mediabox])
+        if src_cropbox is not None:
+            ocr_page["/CropBox"] = pikepdf.Array([float(x) for x in src_cropbox])
+        
+        # Восстанавливаем изображения
         src_res = src_page.get("/Resources") or pikepdf.Dictionary()
         src_xobj = src_res.get("/XObject") or {}
         ocr_res = ocr_page.get("/Resources") or pikepdf.Dictionary()
         ocr_xobj = ocr_res.get("/XObject") or {}
 
         # Собираем оригинальные Image XObjects из source по имени
-        src_images = {
-            k: v for k, v in src_xobj.items() if v.get("/Subtype") == "/Image"
-        }
+        src_images = {k: v for k, v in src_xobj.items() if v.get("/Subtype") == "/Image"}
         if not src_images:
             continue
 
@@ -118,7 +126,11 @@ def _fix_mediabox(input_pdf: Path, fixed_pdf: Path) -> None:
             mb = [float(x) for x in media_box]
             cb = [float(x) for x in crop_box]
             if mb != cb:
-                page["/MediaBox"] = crop_box
+                # Нормализуем CropBox к (0, 0) перед установкой в MediaBox
+                x0, y0, x1, y1 = cb
+                width = x1 - x0
+                height = y1 - y0
+                page["/MediaBox"] = pikepdf.Array([0, 0, width, height])
                 # Удаляем лишние box-ы — они теперь совпадают с MediaBox
                 for box_key in ["/CropBox", "/TrimBox", "/ArtBox", "/BleedBox"]:
                     if box_key in page:
@@ -130,17 +142,85 @@ def _fix_mediabox(input_pdf: Path, fixed_pdf: Path) -> None:
         logger.info(f"  Нормализован MediaBox на {fixed_count} страницах")
 
 
+def _split_landscape_pages(input_pdf: Path, output_pdf: Path) -> list[tuple[int, int, str]]:
+    """
+    Разбивает страницы-развороты на левую и правую половины без перекодирования изображений.
+
+    Страница считается разворотом, если CropBox (или MediaBox) имеет width/height > SPREAD_ASPECT_THRESHOLD.
+    Разбивка работает с оригинальными размерами: берёт CropBox как видимую область, делит его
+    пополам по X, и для каждой половины устанавливает новый CropBox. MediaBox остаётся оригинальным
+    (с полным изображением), что позволяет сохранить качество.
+
+    Args:
+        input_pdf: Входной PDF (может содержать MediaBox >> CropBox)
+        output_pdf: Выходной PDF с разбитыми страницами
+
+    Returns:
+        page_map: список (out_idx, src_idx, side) где side — 'left', 'right' или 'full'
+    """
+    src = pikepdf.open(input_pdf)
+    out = pikepdf.Pdf.new()
+    page_map: list[tuple[int, int, str]] = []
+
+    for src_idx, src_page in enumerate(src.pages):
+        # Берём CropBox (видимая область) или MediaBox, если CropBox нет
+        crop_box = src_page.get("/CropBox")
+        media_box = src_page.get("/MediaBox")
+        visible_box = crop_box if crop_box is not None else media_box
+        
+        if visible_box is None:
+            # Страница без размеров — просто копируем
+            out.pages.append(src_page)
+            page_map.append((len(out.pages) - 1, src_idx, "full"))
+            continue
+        
+        x0, y0, x1, y1 = [float(v) for v in visible_box]
+        width = x1 - x0
+        height = y1 - y0
+        is_spread = width > height and (width / height) > SPREAD_ASPECT_THRESHOLD
+
+        if is_spread:
+            # Разворот — делим пополам по X
+            mid = x0 + width / 2.0
+            for half_x0, half_x1, side in [(x0, mid, "left"), (mid, x1, "right")]:
+                out_idx = len(out.pages)
+                out.pages.append(src_page)
+                new_page = out.pages[out_idx]
+                # Устанавливаем CropBox на половину, MediaBox оставляем оригинальным
+                new_page["/CropBox"] = pikepdf.Array([half_x0, y0, half_x1, y1])
+                # Удаляем лишние box-ы
+                for box_key in ["/TrimBox", "/ArtBox", "/BleedBox"]:
+                    if box_key in new_page:
+                        del new_page[box_key]
+                page_map.append((out_idx, src_idx, side))
+        else:
+            # Обычная страница — копируем как есть
+            out_idx = len(out.pages)
+            out.pages.append(src_page)
+            page_map.append((out_idx, src_idx, "full"))
+
+    out.save(output_pdf)
+    src.close()
+
+    spread_count = sum(1 for _, _, s in page_map if s == "left")
+    if spread_count:
+        logger.info(f"  Разворотов разбито: {spread_count}, страниц в результате: {len(page_map)}")
+    return page_map
+
+
 def process_pdf_with_ocr(
     input_pdf: Path,
     output_pdf: Path,
     language: str = "rus",
     skip_existing: bool = True,
     jobs: int | None = None,
-    dpi: int = 300,
     pages: str | None = None,
+    page: int | None = None,
+    start_with_one: bool = True,
     clean: bool = True,
     oversample: int = 600,
     deskew: bool = False,
+    split_landscape: bool = False,
 ) -> bool:
     """
     Добавляет текстовый слой к PDF-документу с помощью ocrmypdf.
@@ -157,8 +237,12 @@ def process_pdf_with_ocr(
         language: Язык распознавания (rus, eng и т.д.)
         skip_existing: Пропускать уже обработанные файлы
         jobs: Количество параллельных задач для Tesseract
-        dpi: DPI для рендеринга страниц (по умолчанию 300)
-        pages: Диапазон страниц для обработки (например "5-7"), None — все страницы
+        pages: Диапазон страниц для обработки (например "5-7"), None — все страницы.
+               Игнорируется при split_landscape=True (нумерация меняется после разбивки).
+        page: Номер одной страницы для обработки. Перекрывает pages.
+              Игнорируется при split_landscape=True.
+        start_with_one: Если True (по умолчанию), page считается 1-based.
+                        Если False — 0-based (конвертируется в 1-based внутри).
         clean: Удаление шума через unpaper перед OCR (не затрагивает финальное изображение)
         oversample: Повышение разрешения до указанного DPI перед OCR (0 — отключено).
                 ВНИМАНИЕ: если значение > DPI исходника, ocrmypdf растеризует страницу
@@ -168,6 +252,10 @@ def process_pdf_with_ocr(
                 ВНИМАНИЕ: в отличие от --clean, deskew ИЗМЕНЯЕТ финальное изображение
                 (физически поворачивает и перекодирует JPEG). Если важно сохранить
                 оригинальную картинку — держите False.
+        split_landscape: Если True — перед OCR разбивает страницы-развороты на левую
+                и правую половины (без перекодирования). Oversample и deskew применяются
+                к каждой половине отдельно. Финальные изображения берутся из разбитого
+                PDF (т.е. оригинальные сканы с MediaBox, обрезающим нужную половину).
 
     Returns:
         True если обработка успешна, False иначе
@@ -182,6 +270,14 @@ def process_pdf_with_ocr(
         if jobs is None:
             jobs = get_optimal_jobs()
 
+        # Определяем диапазон страниц (только для обычного режима, не split_landscape)
+        effective_pages: str | None = None
+        if page is not None:
+            page_1based = page if start_with_one else page + 1
+            effective_pages = str(page_1based)
+        elif pages is not None:
+            effective_pages = pages
+
         # Нормализуем MediaBox во временный файл
         with tempfile.TemporaryDirectory(prefix="ocr_fix_") as tmpdir:
             fixed_path = Path(tmpdir) / "fixed.pdf"
@@ -190,15 +286,14 @@ def process_pdf_with_ocr(
             # language для ocrmypdf — список строк
             lang_list = [lang.strip() for lang in language.split("+")]
 
-            # ocrmypdf добавляет текстовый слой, не перекодируя изображения
-            # --output-type pdf — без принудительной конвертации в PDF/A (минимальные изменения)
+            # Базовые параметры ocrmypdf:
+            # --output-type pdf — без принудительной конвертации в PDF/A
             # --skip-text — пропускать страницы, где уже есть текст
             # --optimize 0 — без дополнительной оптимизации (сохраняем оригинал)
             # --clean — удаление шума через unpaper (только для OCR, не для финала)
             # --deskew — исправление наклона через unpaper (МЕНЯЕТ финальную картинку)
             # --oversample — повышение разрешения для лучшего распознавания
             # --rotate-pages — автоопределение ориентации (для повёрнутых на 90° таблиц)
-            # progress_bar — постраничный прогресс внутри каждого PDF
             kwargs: dict = dict(
                 language=lang_list,
                 jobs=jobs,
@@ -212,17 +307,69 @@ def process_pdf_with_ocr(
                 progress_bar=True,
             )
 
-            if pages is not None:
-                kwargs["pages"] = pages
+            if split_landscape:
+                # Пайплайн с разбивкой разворотов:
+                # 1) Разбиваем развороты на левую+правую половины (БЕЗ fix_mediabox — работаем с оригиналом)
+                # 2) Нормализуем MediaBox=CropBox для разбитых страниц
+                # 3) OCR по разбитым страницам (oversample/deskew/rotate для каждой половины)
+                # 4) Подменяем изображения в OCR-PDF на оригиналы из разбитого PDF
+                
+                # Шаг 1: Разбиваем развороты на оригинальном PDF (до fix_mediabox)
+                split_path = Path(tmpdir) / "split.pdf"
+                page_map = _split_landscape_pages(input_pdf, split_path)
+                
+                # Если указана конкретная страница — найдём её в page_map
+                split_pages: str | None = None
+                if effective_pages is not None:
+                    # Парсим effective_pages (может быть "5" или "5-7")
+                    if "-" in effective_pages:
+                        start_str, end_str = effective_pages.split("-", 1)
+                        src_pages = list(range(int(start_str) - 1, int(end_str)))
+                    else:
+                        src_pages = [int(effective_pages) - 1]
+                    
+                    # Находим соответствующие страницы в разбитом PDF
+                    out_indices = [out_idx for out_idx, src_idx, _ in page_map if src_idx in src_pages]
+                    if out_indices:
+                        # Формируем диапазон для ocrmypdf (1-based)
+                        out_indices_1based = [idx + 1 for idx in out_indices]
+                        if len(out_indices_1based) == 1:
+                            split_pages = str(out_indices_1based[0])
+                        else:
+                            # Формируем диапазон (может быть несколько несмежных страниц)
+                            split_pages = ",".join(str(idx) for idx in out_indices_1based)
+                        logger.info(
+                            f"  Исходная страница {effective_pages} → разбитые страницы {split_pages}"
+                        )
+                
+                # Шаг 2: Нормализуем MediaBox=CropBox для разбитых страниц
+                split_fixed = Path(tmpdir) / "split_fixed.pdf"
+                _fix_mediabox(split_path, split_fixed)
+                
+                # Шаг 3: OCR
+                if split_pages is not None:
+                    kwargs["pages"] = split_pages
+                
+                if oversample > 0:
+                    ocr_hires = Path(tmpdir) / "ocr_hires.pdf"
+                    ocrmypdf.ocr(split_fixed, ocr_hires, **kwargs)
+                    # Шаг 4: Подменяем изображения на оригиналы из split_path (до fix_mediabox)
+                    # split_path содержит полные изображения с CropBox, split_fixed — обрезанные
+                    _restore_original_images(split_path, ocr_hires, output_pdf)
+                else:
+                    ocrmypdf.ocr(split_fixed, output_pdf, **kwargs)
 
-            if oversample > 0:
-                # OCR выполняется на апсемплированной картинке (лучше распознавание),
-                # но в финальный PDF встраиваются оригинальные изображения из fixed_path.
-                ocr_hires = Path(tmpdir) / "ocr_hires.pdf"
-                ocrmypdf.ocr(fixed_path, ocr_hires, **kwargs)
-                _restore_original_images(fixed_path, ocr_hires, output_pdf)
             else:
-                ocrmypdf.ocr(fixed_path, output_pdf, **kwargs)
+                # Обычный пайплайн без разбивки
+                if effective_pages is not None:
+                    kwargs["pages"] = effective_pages
+
+                if oversample > 0:
+                    ocr_hires = Path(tmpdir) / "ocr_hires.pdf"
+                    ocrmypdf.ocr(fixed_path, ocr_hires, **kwargs)
+                    _restore_original_images(fixed_path, ocr_hires, output_pdf)
+                else:
+                    ocrmypdf.ocr(fixed_path, output_pdf, **kwargs)
 
         logger.info(f"✓ Успешно обработан {input_pdf.name}")
         return True
@@ -315,9 +462,7 @@ def process_directory(
         # Создаём промежуточные подпапки, если нужно
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
-        if process_pdf_with_ocr(
-            pdf_file, output_file, language, skip_existing, jobs, deskew=deskew
-        ):
+        if process_pdf_with_ocr(pdf_file, output_file, language, skip_existing, jobs, deskew=deskew):
             success_count += 1
 
         # Обновляем описание прогресс-бара с текущим счётчиком
@@ -326,14 +471,30 @@ def process_directory(
     return success_count, total
 
 
+def _extract_pages_to_pdf(input_pdf: Path, output_pdf: Path, page_indices: list[int]) -> None:
+    """
+    Извлекает указанные страницы (0-based) в отдельный PDF без перекодирования.
+
+    Args:
+        input_pdf: Исходный PDF
+        output_pdf: Путь для сохранения результата
+        page_indices: Список 0-based индексов страниц
+    """
+    src = pikepdf.open(input_pdf)
+    out = pikepdf.Pdf.new()
+    for idx in page_indices:
+        out.pages.append(src.pages[idx])
+    out.save(output_pdf)
+    src.close()
+
+
 def test_on_sample_pages():
     """
     Тестовый запуск: обрабатывает несколько страниц из середины первого PDF
     и проверяет, что русский текст корректно распознан.
     """
-    script_dir = Path(__file__).parent
-    input_dir = script_dir / "ocr_src"
-    output_dir = script_dir / "ocr_dest"
+    input_dir = Path(__file__).parent / "ocr_src"
+    output_dir = Path(__file__).parent / "ocr_dest"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     pdf_files = sorted(input_dir.glob("*.pdf"))
@@ -344,45 +505,114 @@ def test_on_sample_pages():
     test_pdf = pdf_files[0]
     test_output = output_dir / f"_test_{test_pdf.name}"
 
-    # Удаляем предыдущий тестовый файл, если есть
     if test_output.exists():
         test_output.unlink()
 
     logger.info(f"Тестовый запуск на {test_pdf.name}, страницы 5-7")
 
-    # Обрабатываем только страницы 5-7 из середины
     success = process_pdf_with_ocr(
-        input_pdf=test_pdf,
-        output_pdf=test_output,
-        language="rus",
-        skip_existing=False,
-        pages="5-7",
+        input_pdf=test_pdf, output_pdf=test_output, language="rus", skip_existing=False, pages="5-7"
     )
 
     if not success:
         logger.error("Тестовый запуск провалился!")
         return
 
-    # Проверяем размеры файлов
     original_size = test_pdf.stat().st_size
     result_size = test_output.stat().st_size
     logger.info(f"Размер оригинала: {original_size / 1024 / 1024:.1f} МБ")
     logger.info(f"Размер результата: {result_size / 1024 / 1024:.1f} МБ")
     logger.info(f"Соотношение: {result_size / original_size:.2f}x")
 
-    # Извлекаем текст со страниц 5-7 (0-индексация: 4-6)
     for page_idx in [4, 5, 6]:
         text = verify_ocr_text(test_output, page_idx)
         preview = text[:300].strip()
         has_cyrillic = any("\u0400" <= ch <= "\u04ff" for ch in text)
-        logger.info(
-            f"--- Страница {page_idx + 1} (кириллица: {'✓' if has_cyrillic else '✗'}) ---"
-        )
+        logger.info(f"--- Страница {page_idx + 1} (кириллица: {'✓' if has_cyrillic else '✗'}) ---")
         logger.info(f"{preview}")
 
-    # Удаляем тестовый файл
     test_output.unlink()
     logger.info("Тестовый файл удалён")
+
+
+def test_split_on_page(
+    source_pdf: Path,
+    page_idx: int = 122,
+    output_dir: Path | None = None,
+) -> None:
+    """
+    Тест разбивки разворота: обрабатывает одну страницу двумя способами
+    (с разбивкой и без) и сравнивает качество OCR по количеству кириллических символов.
+
+    Args:
+        source_pdf: Исходный PDF
+        page_idx: 0-based индекс страницы (по умолчанию 122)
+        output_dir: Директория для сохранения результатов (по умолчанию рядом с source_pdf)
+    """
+    if not source_pdf.exists():
+        logger.error(f"Файл не найден: {source_pdf}")
+        return
+
+    src_doc = fitz.open(source_pdf)
+    total_pages = len(src_doc)
+    src_doc.close()
+
+    if page_idx >= total_pages:
+        logger.error(f"Страница {page_idx} не существует в {source_pdf.name} ({total_pages} страниц)")
+        return
+
+    if output_dir is None:
+        output_dir = source_pdf.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = source_pdf.stem
+    out_nosplit = output_dir / f"_test_{stem}_p{page_idx}_nosplit.pdf"
+    out_split = output_dir / f"_test_{stem}_p{page_idx}_split.pdf"
+    for p in [out_nosplit, out_split]:
+        if p.exists():
+            p.unlink()
+
+    # Извлекаем только нужную страницу во временный PDF
+    with tempfile.TemporaryDirectory(prefix="ocr_test_") as tmpdir:
+        single_page_pdf = Path(tmpdir) / "single_page.pdf"
+        _extract_pages_to_pdf(source_pdf, single_page_pdf, [page_idx])
+
+        logger.info(f"=== Тест без разбивки: {source_pdf.name}, страница {page_idx} ===")
+        process_pdf_with_ocr(
+            input_pdf=single_page_pdf,
+            output_pdf=out_nosplit,
+            language="rus",
+            skip_existing=False,
+            split_landscape=False,
+        )
+
+        logger.info(f"=== Тест с разбивкой разворота: {source_pdf.name}, страница {page_idx} ===")
+        process_pdf_with_ocr(
+            input_pdf=single_page_pdf,
+            output_pdf=out_split,
+            language="rus",
+            skip_existing=False,
+            split_landscape=True,
+        )
+
+    # Сравниваем OCR-текст
+    logger.info("=== Результаты ===")
+    for label, pdf_path in [("без разбивки", out_nosplit), ("с разбивкой", out_split)]:
+        if not pdf_path.exists():
+            logger.warning(f"  {label}: файл не создан")
+            continue
+        size_mb = pdf_path.stat().st_size / 1024 / 1024
+        doc = fitz.open(pdf_path)
+        n_pages = len(doc)
+        full_text = "\n".join(doc[i].get_text() for i in range(n_pages))
+        doc.close()
+        cyrillic_chars = sum(1 for ch in full_text if "\u0400" <= ch <= "\u04ff")
+        logger.info(
+            f"  {label}: {n_pages} стр., "
+            f"{size_mb:.1f} МБ, кириллица: {cyrillic_chars} символов"
+        )
+        logger.info(f"  Текст ({label}): {full_text[:400].strip()}")
+        logger.info(f"  Сохранён: {pdf_path}")
 
 
 def main():
@@ -390,18 +620,14 @@ def main():
     # Определяем пути относительно текущего файла
     script_dir = Path(__file__).parent
     # input_dir = script_dir / "ocr_src"
-    input_dir = Path("/mnt/dump3/DOWN/Плановое хозяйство (1931-1989)")
+    input_dir = Path("/mnt/dump3/DOWN/Плановое хозяйство (1931-1989)") / "1939"
     output_dir = Path("/mnt/dump3/DOWN/Плановое хозяйство (1931-1989) [распознанное]")
 
     logger.info(f"Исходная директория: {input_dir}")
     logger.info(f"Целевая директория: {output_dir}")
 
     success, total = process_directory(
-        input_dir=input_dir,
-        output_dir=output_dir,
-        language="rus",
-        skip_existing=True,
-        deskew=False,
+        input_dir=input_dir, output_dir=output_dir, language="rus", skip_existing=True, deskew=False
     )
 
     logger.info(f"\n{'=' * 50}")
